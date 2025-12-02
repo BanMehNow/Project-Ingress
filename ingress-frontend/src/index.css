@@ -1,0 +1,24 @@
+body {
+  margin: 0;
+  /* ↑ Remove browser default margin so layout aligns edge-to-edge */
+
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  /* ↑ Modern system font stack for crisp UI text */
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* ↑ Improves text rendering smoothness across browsers */
+
+  background: #0f172a; /* dark background */
+  /* ↑ Matches the app’s main dark theme */
+
+  color: #e5e7eb;
+  /* ↑ Light grey text for high contrast on dark background */
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, "Courier New",
+    monospace;
+  /* ↑ Code font used when wrapping values in <code> tags */
+}

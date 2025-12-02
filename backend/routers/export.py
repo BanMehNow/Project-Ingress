@@ -1,0 +1,173 @@
+from fastapi import APIRouter, HTTPException, Query
+# ↑ FastAPI routing + error handling + query parameter helper.
+
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+# ↑ Used to return file-like responses (CSV/JSON/Markdown downloads).
+
+from typing import Literal, Dict, Any
+# ↑ Literal restricts certain parameters to fixed strings (“csv”, “json”).
+
+import io, json, pandas as pd
+# ↑ `io` allows us to treat strings/bytes as file objects; pandas for DataFrames.
+
+from datetime import datetime
+# ↑ Used for timestamps when generating the Data Book.
+
+from ..services.session_store import get_session
+# ↑ Session store gives access to stored uploaded raw bytes & metadata.
+
+from .ingest import _parse_bytes  # reuse the parser
+# ↑ Reuses the original ingestion parser to avoid duplicate logic.
+
+router = APIRouter(prefix="/export", tags=["export"])
+# ↑ This groups all export routes under /export/* and tags them for Swagger docs.
+
+
+def _bytes_to_df(raw: bytes, detected: str) -> pd.DataFrame:
+    # ↑ Convert the original uploaded content into a usable Pandas DataFrame.
+
+    prev = _parse_bytes(raw, detected)
+    # ↑ Run the same parsing function used during preview ingestion.
+
+    # try reconstruct from preview if parser returned only sample
+    if prev.get("columns") and prev.get("sample") and len(prev["sample"]) > 0:
+        df = pd.DataFrame(prev["sample"])
+        # ↑ Build DataFrame from preview sample rows.
+
+        # columns order from preview
+        df = df[[c for c in prev["columns"] if c in df.columns]]
+        # ↑ Maintain column ordering from ingestion pipeline.
+
+        return df
+
+    # fallback best-effort CSV
+    try:
+        return pd.read_csv(io.BytesIO(raw))
+        # ↑ If ingestion preview failed, still attempt raw CSV parsing.
+    except Exception:
+        return pd.DataFrame()
+        # ↑ Return empty DataFrame if everything fails.
+
+
+@router.get("/{session_id}")
+def export_dataset(
+    session_id: str,
+    format: Literal["csv", "json"] = Query("csv", description="csv or json"),
+    filename: str | None = None
+):
+    ses = get_session(session_id)
+    if not ses:
+        raise HTTPException(404, "Session not found")
+    # ↑ Validate that the session exists.
+
+    raw: bytes = ses.get("raw", b"")
+    detected: str = ses.get("detected_type", "unknown")
+    df = _bytes_to_df(raw, detected)
+    # ↑ Convert the stored bytes into a DataFrame.
+
+    if df.empty and not raw:
+        raise HTTPException(400, "Nothing to export for this session")
+    # ↑ Prevent exporting empty or missing data.
+
+    # sensible default filename
+    if not filename:
+        base = "dataset"
+        if ses["meta"].get("filename"):
+            base = ses["meta"]["filename"].rsplit(".", 1)[0]
+        filename = f"{base}.{format}"
+        # ↑ Default filename = original uploaded file name (minus extension).
+
+    # ---- CSV EXPORT ----
+    if format == "csv":
+        s = io.StringIO()
+        df.to_csv(s, index=False)
+        # ↑ Write CSV text into an in-memory string.
+
+        b = io.BytesIO(s.getvalue().encode("utf-8"))
+        # ↑ Convert text -> bytes so it can be streamed properly.
+
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(b, media_type="text/csv", headers=headers)
+        # ↑ Browser downloads the CSV file.
+
+    # ---- JSON EXPORT ----
+    records = df.to_dict(orient="records")
+    # ↑ Convert DataFrame rows into dictionaries.
+
+    b = io.BytesIO(json.dumps(records, ensure_ascii=False).encode("utf-8"))
+    # ↑ Encode the JSON into bytes while preserving unicode.
+
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(b, media_type="application/json", headers=headers)
+    # ↑ Browser downloads JSON file.
+
+
+@router.get("/databook/{session_id}")
+def export_databook(session_id: str, format: Literal["json", "md"] = "json"):
+    # ↑ Allows exporting a formal data book (meta + schema) as JSON or Markdown.
+
+    ses = get_session(session_id)
+    if not ses:
+        raise HTTPException(404, "Session not found")
+
+    raw: bytes = ses.get("raw", b"")
+    detected: str = ses.get("detected_type", "unknown")
+    df = _bytes_to_df(raw, detected)
+    # ↑ Try reconstructing the dataset to derive schema.
+
+    schema = {col: str(dtype) for col, dtype in df.dtypes.to_dict().items()}
+    # ↑ Schema dictionary → { column_name: dtype }
+
+    meta: Dict[str, Any] = {
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        # ↑ Timestamp of export.
+
+        "source": ses.get("source"),
+        # ↑ "file" or "url".
+
+        "detected_type": detected,
+        # ↑ csv, json, pdf, html, unknown.
+
+        "rows": int(df.shape[0]),
+        # ↑ Number of rows.
+
+        "columns": list(df.columns),
+        # ↑ Column names in order.
+
+        "provenance": ses.get("meta", {}),
+        # ↑ Extra details saved during ingest.
+
+        "notes": "Auto-generated by Project Ingress",
+        # ↑ Signature message.
+    }
+
+    # ---- MARKDOWN VERSION ----
+    if format == "md":
+        lines = [
+            f"# Data Book",
+            f"- Created: {meta['created_at']}",
+            f"- Source: {meta['source']}",
+            f"- Detected Type: {detected}",
+            f"- Rows: {meta['rows']}",
+            f"- Columns: {len(meta['columns'])}",
+            "",
+            "## Schema",
+        ]
+        # ↑ Markdown header + metadata.
+
+        for c, t in schema.items():
+            lines.append(f"- **{c}**: `{t}`")
+            # ↑ Add schema rows one by one.
+
+        text = "\n".join(lines)
+        headers = {"Content-Disposition": 'attachment; filename="databook.md"'}
+        return PlainTextResponse(text, headers=headers, media_type="text/markdown")
+        # ↑ Browser downloads the .md file.
+
+    # ---- JSON VERSION (DEFAULT) ----
+    databook = {"meta": meta, "schema": schema}
+    # ↑ Structure includes metadata & column schema.
+
+    headers = {"Content-Disposition": 'attachment; filename="databook.json"'}
+    return JSONResponse(databook, headers=headers)
+    # ↑ Browser downloads JSON version.
